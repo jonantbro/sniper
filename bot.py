@@ -33,13 +33,17 @@ DISCORD_MFA_TOKEN = os.getenv("DISCORD_MFA_TOKEN", "").strip()
 GUILD_ID = os.getenv("GUILD_ID", "").strip()
 VANITY_CODE = os.getenv("VANITY_CODE", "gvrn")
 NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID", "1526835509253636210"))
+PING_USER_ID = int(os.getenv("PING_USER_ID", "1524709993499197443"))
+PING_COUNT = int(os.getenv("PING_COUNT", "5"))
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "1"))
+ON_RENDER = os.getenv("RENDER", "").lower() == "true"
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
 claimed = False
 _attempt = 0
+_vanity_was_available = False
 _mfa_token: str | None = None
 _mfa_token_expires = 0.0
 
@@ -50,6 +54,28 @@ def normalize_backup_code(value: str) -> str:
 
 def mfa_still_valid() -> bool:
     return bool(_mfa_token and time.time() < _mfa_token_expires)
+
+
+def get_mfa_header() -> dict[str, str]:
+    if DISCORD_MFA_TOKEN:
+        return {"X-Discord-MFA-Authorization": DISCORD_MFA_TOKEN}
+    if mfa_still_valid() and _mfa_token:
+        return {"X-Discord-MFA-Authorization": _mfa_token}
+    return {}
+
+
+async def check_vanity_available(session: aiohttp.ClientSession) -> bool:
+    """404 on invite = vanity code is not currently taken."""
+    status, _ = await discord_request(
+        session, "GET", f"https://discord.com/api/v10/invites/{VANITY_CODE}?with_counts=false"
+    )
+    return status == 404
+
+
+async def spam_ping(channel: discord.abc.Messageable, message: str) -> None:
+    mention = f"<@{PING_USER_ID}>"
+    for _ in range(PING_COUNT):
+        await channel.send(f"{mention} {message}")
 
 
 def discord_client_headers() -> dict[str, str]:
@@ -182,17 +208,24 @@ async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | 
 
     mfa_note = ""
     url = f"https://discord.com/api/v10/guilds/{GUILD_ID}/vanity-url"
-    extra = {"X-Audit-Log-Reason": "vanity sniper"}
-    if DISCORD_MFA_TOKEN:
-        extra["X-Discord-MFA-Authorization"] = DISCORD_MFA_TOKEN
-    elif mfa_still_valid() and _mfa_token:
-        extra["X-Discord-MFA-Authorization"] = _mfa_token
+    extra = {"X-Audit-Log-Reason": "vanity sniper", **get_mfa_header()}
 
     status, data = await discord_request(
         session, "PATCH", url, json_body={"code": VANITY_CODE}, extra_headers=extra
     )
 
-    if isinstance(data, dict) and data.get("code") == 60003 and not DISCORD_MFA_TOKEN:
+    if isinstance(data, dict) and data.get("code") == 60003:
+        if DISCORD_MFA_TOKEN:
+            mfa_note = "DISCORD_MFA_TOKEN expired — run `local_mfa.py` on your Mac and update Render."
+            return status, data, mfa_note
+
+        if ON_RENDER:
+            mfa_note = (
+                "MFA required — password will NOT work on Render. "
+                "Run `python3 local_mfa.py` on your Mac → paste token as **DISCORD_MFA_TOKEN**."
+            )
+            return status, data, mfa_note
+
         mfa = data.get("mfa") or {}
         ticket = mfa.get("ticket")
         methods = mfa.get("methods") or []
@@ -207,10 +240,6 @@ async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | 
                 )
                 return retry_status, retry_data, "MFA verified ✓"
             mfa_note = mfa_error
-        else:
-            mfa_note = "Discord sent 60003 but no MFA ticket."
-    elif isinstance(data, dict) and data.get("code") == 60003 and DISCORD_MFA_TOKEN:
-        mfa_note = "DISCORD_MFA_TOKEN expired — run local_mfa.py on your Mac and update Render."
 
     return status, data, mfa_note
 
@@ -260,7 +289,7 @@ async def notify_channel(channel: discord.abc.Messageable, *, success: bool, sta
 
 @tasks.loop(minutes=INTERVAL_MINUTES)
 async def vanity_sniper() -> None:
-    global claimed, _attempt
+    global claimed, _attempt, _vanity_was_available
 
     if claimed:
         return
@@ -272,6 +301,16 @@ async def vanity_sniper() -> None:
 
     try:
         async with aiohttp.ClientSession() as session:
+            available = await check_vanity_available(session)
+            if available and not _vanity_was_available:
+                _vanity_was_available = True
+                await spam_ping(
+                    channel,
+                    f"**`discord.gg/{VANITY_CODE}` is AVAILABLE** — claiming now!",
+                )
+            elif not available:
+                _vanity_was_available = False
+
             status, data, mfa_note = await try_claim_vanity(session)
     except Exception as exc:
         await notify_channel(channel, success=False, status=0, detail=str(exc))
@@ -279,12 +318,12 @@ async def vanity_sniper() -> None:
 
     if isinstance(data, dict):
         detail = format_discord_error(data, status)
-        if mfa_note:
+        if mfa_note and "Password" not in mfa_note and "password" not in mfa_note:
             detail = f"{detail}\n\n{mfa_note}"
+        elif mfa_note:
+            detail = mfa_note
     else:
-        detail = str(data)
-        if mfa_note:
-            detail = f"{detail}\n\n{mfa_note}"
+        detail = str(data) if not mfa_note else mfa_note
 
     success = status in (200, 201, 204)
     await notify_channel(channel, success=success, status=status, detail=detail)
@@ -292,6 +331,10 @@ async def vanity_sniper() -> None:
     if success:
         claimed = True
         vanity_sniper.stop()
+        await spam_ping(
+            channel,
+            f"**CLAIMED `discord.gg/{VANITY_CODE}`** — go check your server!",
+        )
 
 
 @vanity_sniper.before_loop
@@ -325,12 +368,14 @@ async def on_ready() -> None:
 
         mfa_hint = ""
         if DISCORD_MFA_TOKEN:
-            mfa_hint = "\nUsing **DISCORD_MFA_TOKEN** from env (refresh every ~5 min with `local_mfa.py`)."
-        elif DISCORD_PASSWORD:
+            mfa_hint = "\nUsing **DISCORD_MFA_TOKEN** (refresh every ~5 min with `local_mfa.py`)."
+        elif ON_RENDER:
             mfa_hint = (
-                "\nPassword MFA from Render often fails even when correct. "
-                "Run **`python3 local_mfa.py`** on your Mac → paste token as **DISCORD_MFA_TOKEN**."
+                "\n**Render detected** — set **DISCORD_MFA_TOKEN** from `local_mfa.py` "
+                "(password MFA is blocked on cloud servers)."
             )
+        elif DISCORD_PASSWORD:
+            mfa_hint = "\nRunning locally — password MFA enabled."
 
         await channel.send(
             f"Vanity sniper online — trying **`{VANITY_CODE}`** every **{INTERVAL_MINUTES}** minute(s).\n"
