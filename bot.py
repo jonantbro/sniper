@@ -33,19 +33,23 @@ DISCORD_TOTP_SECRET = os.getenv("DISCORD_TOTP_SECRET", "").strip()
 DISCORD_BACKUP_CODE = os.getenv("DISCORD_BACKUP_CODE", "").strip()
 DISCORD_MFA_TOKEN = os.getenv("DISCORD_MFA_TOKEN", "").strip()
 GUILD_ID = os.getenv("GUILD_ID", "").strip()
+NOTIFY_GUILD_ID = os.getenv("NOTIFY_GUILD_ID", "").strip()
 VANITY_CODE = os.getenv("VANITY_CODE", "gvrn")
 NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID", "1526835509253636210"))
 PING_USER_ID = int(os.getenv("PING_USER_ID", "1524709993499197443"))
 PING_COUNT = int(os.getenv("PING_COUNT", "100"))
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "1"))
+API_BASE = "https://discord.com/api/v9"
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 claimed = False
 _attempt = 0
+_last_error_key = ""
 _mfa_token: str | None = None
 _mfa_token_expires = 0.0
+_sniper_started = False
 
 
 def normalize_backup_code(value: str) -> str:
@@ -65,28 +69,24 @@ def get_mfa_header() -> dict[str, str]:
 
 
 def discord_client_headers() -> dict[str, str]:
-    token = USER_TOKEN or BOT_TOKEN
+    token = USER_TOKEN
     if not token:
-        raise RuntimeError("Set DISCORD_USER_TOKEN or DISCORD_BOT_TOKEN")
+        raise RuntimeError("Set DISCORD_USER_TOKEN")
 
-    ua = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
     super_props = base64.b64encode(
         json.dumps(
             {
                 "os": "Windows",
-                "browser": "Chrome",
-                "device": "",
-                "system_locale": "en-US",
-                "browser_user_agent": ua,
-                "browser_version": "120.0.0.0",
-                "os_version": "10",
-                "referrer": "",
-                "referring_domain": "",
+                "browser": "Discord Client",
                 "release_channel": "stable",
+                "client_version": "1.0.9157",
+                "os_version": "10.0.22621",
+                "os_arch": "x64",
+                "system_locale": "en-US",
+                "browser_user_agent": "",
+                "browser_version": "",
                 "client_build_number": 261165,
+                "client_event_source": None,
             },
             separators=(",", ":"),
         ).encode()
@@ -95,14 +95,17 @@ def discord_client_headers() -> dict[str, str]:
     return {
         "Authorization": token,
         "Content-Type": "application/json",
-        "User-Agent": ua,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
         "X-Super-Properties": super_props,
+        "X-Discord-Locale": "en-US",
+        "X-Discord-Timezone": "America/New_York",
         "Origin": "https://discord.com",
-        "Referer": "https://discord.com/channels/@me",
+        "Referer": f"https://discord.com/channels/{GUILD_ID}/{GUILD_ID}",
     }
 
 
-def build_mfa_attempts(methods: list[dict]) -> list[tuple[str, str]]:
+def build_mfa_attempts() -> list[tuple[str, str]]:
     attempts: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -151,34 +154,28 @@ async def discord_request(
         return resp.status, data
 
 
-async def finish_mfa(
-    session: aiohttp.ClientSession, ticket: str, methods: list[dict]
-) -> tuple[str | None, str]:
-    attempts = build_mfa_attempts(methods)
-    errors: list[str] = []
-
+async def finish_mfa(session: aiohttp.ClientSession, ticket: str) -> tuple[str | None, str]:
+    attempts = build_mfa_attempts()
     if not attempts:
-        return None, "Set DISCORD_PASSWORD in Render env vars."
+        return None, "Set DISCORD_PASSWORD in Render."
 
+    errors: list[str] = []
     for mfa_type, data in attempts:
         payload = {"ticket": ticket, "mfa_type": mfa_type, "data": data}
         status, parsed = await discord_request(
-            session, "POST", "https://discord.com/api/v10/mfa/finish", json_body=payload
+            session, "POST", f"{API_BASE}/mfa/finish", json_body=payload
         )
-        if status == 200 and isinstance(parsed, dict):
-            token = parsed.get("token")
-            if token:
-                return token, ""
-        errors.append(f"{mfa_type} failed ({status}): {str(parsed)[:120]}")
+        if status == 200 and isinstance(parsed, dict) and parsed.get("token"):
+            return parsed["token"], ""
+        errors.append(f"{mfa_type} ({status}): {str(parsed)[:100]}")
 
-    return None, "MFA failed — " + " | ".join(errors[:2])
+    return None, "MFA failed: " + " | ".join(errors[:2])
 
 
 async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | str, str]:
     global _mfa_token, _mfa_token_expires
 
-    mfa_note = ""
-    url = f"https://discord.com/api/v10/guilds/{GUILD_ID}/vanity-url"
+    url = f"{API_BASE}/guilds/{GUILD_ID}/vanity-url"
     extra = {"X-Audit-Log-Reason": "vanity sniper", **get_mfa_header()}
 
     status, data = await discord_request(
@@ -186,33 +183,23 @@ async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | 
     )
 
     if isinstance(data, dict) and data.get("code") == 60003:
-        if DISCORD_MFA_TOKEN:
-            mfa_note = "DISCORD_MFA_TOKEN expired — update it in Render."
-            return status, data, mfa_note
+        ticket = (data.get("mfa") or {}).get("ticket")
+        if not ticket:
+            return status, data, "MFA required but no ticket returned."
 
-        mfa = data.get("mfa") or {}
-        ticket = mfa.get("ticket")
-        methods = mfa.get("methods") or []
-        if ticket:
-            token, mfa_error = await finish_mfa(session, ticket, methods)
-            if token:
-                _mfa_token = token
-                _mfa_token_expires = time.time() + 4 * 60 + 30  # cache ~4.5 min
-                extra["X-Discord-MFA-Authorization"] = token
-                retry_status, retry_data = await discord_request(
-                    session, "PATCH", url, json_body={"code": VANITY_CODE}, extra_headers=extra
-                )
-                return retry_status, retry_data, "MFA verified ✓"
-            mfa_note = mfa_error
+        token, err = await finish_mfa(session, ticket)
+        if not token:
+            return status, data, err
 
-    return status, data, mfa_note
+        _mfa_token = token
+        _mfa_token_expires = time.time() + 4 * 60 + 30
+        extra["X-Discord-MFA-Authorization"] = token
+        retry_status, retry_data = await discord_request(
+            session, "PATCH", url, json_body={"code": VANITY_CODE}, extra_headers=extra
+        )
+        return retry_status, retry_data, "MFA verified ✓"
 
-
-async def spam_ping(channel: discord.abc.Messageable) -> None:
-    """Send PING_COUNT separate messages, each pinging the user."""
-    mention = f"<@{PING_USER_ID}>"
-    for _ in range(PING_COUNT):
-        await channel.send(mention)
+    return status, data, ""
 
 
 def format_discord_error(data: dict, status: int) -> str:
@@ -220,27 +207,50 @@ def format_discord_error(data: dict, status: int) -> str:
     msg = data.get("message") or ""
 
     hints = {
-        50020: f"`{VANITY_CODE}` is **taken** — not free yet. Bot is working; will keep trying.",
+        50020: f"`{VANITY_CODE}` is taken — will keep trying.",
         20045: "Server needs **Boost Level 3** for vanity URLs.",
-        50013: "Missing **Manage Server** permission.",
-        60003: "MFA expired — will retry with password next attempt.",
+        50013: "Missing **Manage Server** permission on target guild.",
+        60003: "MFA expired — retrying with password next loop.",
         50035: f"Invalid vanity code `{VANITY_CODE}`.",
+        10008: (
+            "Discord **blocked this request** (anti-bot / cloud IP). "
+            "MFA passed but Render IP is flagged. Try running bot **locally on your Mac** with `./run.sh`."
+        ),
     }
     if code in hints:
         return hints[code]
 
-    # Discord often returns 403 + "Unknown Message" when vanity is taken (after MFA passes).
-    if status == 403 and (not msg or msg == "Unknown Message"):
-        return f"`{VANITY_CODE}` is **taken** — not free yet. Bot is working; will keep trying."
+    if status == 403 and code == 10008:
+        return hints[10008]
 
-    if msg and msg != "Unknown Message":
+    if msg and msg not in ("Unknown Message", "Message inconnu"):
         return f"{msg} (code {code})" if code is not None else msg
+
     if code is not None:
         return f"Discord error **{code}** (HTTP {status})"
+
     return f"HTTP {status}: {json.dumps(data)[:200]}"
 
 
-async def notify_channel(channel: discord.abc.Messageable, *, success: bool, status: int, detail: str) -> None:
+def is_claim_success(status: int, data: dict | str) -> bool:
+    if status not in (200, 201, 204):
+        return False
+    if isinstance(data, dict):
+        returned = (data.get("code") or data.get("vanity_url_code") or "").lower()
+        if returned and returned != VANITY_CODE.lower():
+            return False
+    return True
+
+
+async def spam_ping(channel: discord.abc.Messageable) -> None:
+    mention = f"<@{PING_USER_ID}>"
+    for _ in range(PING_COUNT):
+        await channel.send(mention)
+
+
+async def notify_channel(
+    channel: discord.abc.Messageable, *, success: bool, status: int, detail: str
+) -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     if success:
         embed = discord.Embed(
@@ -260,31 +270,59 @@ async def notify_channel(channel: discord.abc.Messageable, *, success: bool, sta
     await channel.send(embed=embed)
 
 
-@bot.tree.command(name="set-claim", description="Set which vanity URL code to snipe")
-@app_commands.describe(vanity="Vanity code to claim (e.g. gvrn)")
-async def set_claim(interaction: discord.Interaction, vanity: str) -> None:
-    global VANITY_CODE, claimed, _attempt
+async def set_vanity_target(vanity: str) -> str:
+    global VANITY_CODE, claimed, _attempt, _last_error_key
 
     vanity = vanity.lower().strip()
     if not re.fullmatch(r"[a-z0-9-]{2,32}", vanity):
-        await interaction.response.send_message(
-            "Invalid vanity. Use 2–32 characters: `a-z`, `0-9`, hyphens only.",
-            ephemeral=True,
-        )
-        return
+        raise ValueError("Invalid vanity. Use 2–32 chars: a-z, 0-9, hyphens.")
 
     VANITY_CODE = vanity
     claimed = False
     _attempt = 0
+    _last_error_key = ""
+    return vanity
+
+
+@bot.tree.command(name="set-vanity", description="Set which vanity URL code to snipe")
+@app_commands.describe(vanity="Vanity code to claim (e.g. gvflop)")
+async def set_vanity_cmd(interaction: discord.Interaction, vanity: str) -> None:
+    try:
+        vanity = await set_vanity_target(vanity)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
 
     await interaction.response.send_message(
-        f"Now sniping **`discord.gg/{vanity}`** — attempts every **{INTERVAL_MINUTES}** minute(s)."
+        f"Now sniping **`discord.gg/{vanity}`** every **{INTERVAL_MINUTES}** minute(s)."
+    )
+
+
+@bot.tree.command(name="set-claim", description="Alias for /set-vanity")
+@app_commands.describe(vanity="Vanity code to claim")
+async def set_claim_cmd(interaction: discord.Interaction, vanity: str) -> None:
+    try:
+        vanity = await set_vanity_target(vanity)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"Now sniping **`discord.gg/{vanity}`** every **{INTERVAL_MINUTES}** minute(s)."
+    )
+
+
+@bot.tree.command(name="status", description="Show current snipe target")
+async def status_cmd(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(
+        f"Target: **`discord.gg/{VANITY_CODE}`** | Attempts: **{_attempt}** | Claimed: **{claimed}**",
+        ephemeral=True,
     )
 
 
 @tasks.loop(minutes=INTERVAL_MINUTES)
 async def vanity_sniper() -> None:
-    global claimed, _attempt
+    global claimed, _attempt, _last_error_key
 
     if claimed:
         return
@@ -298,24 +336,33 @@ async def vanity_sniper() -> None:
         async with aiohttp.ClientSession() as session:
             status, data, mfa_note = await try_claim_vanity(session)
     except Exception as exc:
-        await notify_channel(channel, success=False, status=0, detail=str(exc))
+        error_key = f"exc:{exc}"
+        if error_key != _last_error_key:
+            _last_error_key = error_key
+            await notify_channel(channel, success=False, status=0, detail=str(exc))
         return
 
-    if isinstance(data, dict):
-        detail = format_discord_error(data, status)
-        if mfa_note:
-            detail = f"{detail}\n\n{mfa_note}" if detail else mfa_note
-    else:
-        detail = str(data) if not mfa_note else mfa_note
-
-    success = status in (200, 201, 204)
-    await notify_channel(channel, success=success, status=status, detail=detail)
+    success = is_claim_success(status, data)
 
     if success:
         claimed = True
         vanity_sniper.stop()
         await channel.send(f"**CLAIMED `discord.gg/{VANITY_CODE}`**")
         await spam_ping(channel)
+        return
+
+    if isinstance(data, dict):
+        detail = format_discord_error(data, status)
+        if mfa_note:
+            detail = f"{detail}\n\n{mfa_note}"
+    else:
+        detail = str(data)
+
+    error_key = f"{status}:{detail[:80]}"
+    # Only notify when error changes — stops spam every minute for same error
+    if error_key != _last_error_key:
+        _last_error_key = error_key
+        await notify_channel(channel, success=False, status=status, detail=detail)
 
 
 @vanity_sniper.before_loop
@@ -324,7 +371,7 @@ async def before_vanity_sniper() -> None:
 
 
 async def fetch_token_user(session: aiohttp.ClientSession) -> str | None:
-    status, data = await discord_request(session, "GET", "https://discord.com/api/v10/users/@me")
+    status, data = await discord_request(session, "GET", f"{API_BASE}/users/@me")
     if status != 200 or not isinstance(data, dict):
         return None
     return data.get("global_name") or data.get("username")
@@ -332,36 +379,46 @@ async def fetch_token_user(session: aiohttp.ClientSession) -> str | None:
 
 @bot.event
 async def setup_hook() -> None:
-    if GUILD_ID.isdigit():
-        bot.tree.copy_global_to(guild=discord.Object(id=int(GUILD_ID)))
-        await bot.tree.sync(guild=discord.Object(id=int(GUILD_ID)))
+    guild_ids: set[int] = set()
+    for raw_id in (NOTIFY_GUILD_ID, GUILD_ID):
+        if raw_id.isdigit():
+            guild_ids.add(int(raw_id))
+
+    if guild_ids:
+        for gid in guild_ids:
+            bot.tree.copy_global_to(guild=discord.Object(id=gid))
+            synced = await bot.tree.sync(guild=discord.Object(id=gid))
+            print(f"Synced {len(synced)} commands to guild {gid}")
     else:
-        await bot.tree.sync()
-    print("Slash commands synced")
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} commands globally")
 
 
 @bot.event
 async def on_ready() -> None:
+    global _sniper_started
+
     print(f"Logged in as {bot.user} ({bot.user.id})")
-    if not vanity_sniper.is_running():
-        channel = bot.get_channel(NOTIFY_CHANNEL_ID)
-        if channel is None:
-            channel = await bot.fetch_channel(NOTIFY_CHANNEL_ID)
+    if _sniper_started or vanity_sniper.is_running():
+        return
 
-        token_account = "MISSING — add DISCORD_USER_TOKEN"
-        if USER_TOKEN:
-            token_account = "invalid or expired token"
-            async with aiohttp.ClientSession() as session:
-                user = await fetch_token_user(session)
-                if user:
-                    token_account = user
+    _sniper_started = True
+    channel = bot.get_channel(NOTIFY_CHANNEL_ID)
+    if channel is None:
+        channel = await bot.fetch_channel(NOTIFY_CHANNEL_ID)
 
-        await channel.send(
-            f"Vanity sniper online — trying **`{VANITY_CODE}`** every **{INTERVAL_MINUTES}** minute(s).\n"
-            f"User token account: **`{token_account}`** | Password MFA: **{'on' if DISCORD_PASSWORD else 'off'}**\n"
-            f"Use **`/set-claim`** to change target vanity."
-        )
-        vanity_sniper.start()
+    token_account = "invalid/expired token"
+    async with aiohttp.ClientSession() as session:
+        user = await fetch_token_user(session)
+        if user:
+            token_account = user
+
+    await channel.send(
+        f"Vanity sniper online — trying **`{VANITY_CODE}`** every **{INTERVAL_MINUTES}** min.\n"
+        f"Account: **`{token_account}`** | Commands: **`/set-vanity`** **`/status`**\n"
+        f"Set **NOTIFY_GUILD_ID** in Render to the server where you use slash commands."
+    )
+    vanity_sniper.start()
 
 
 def validate_config() -> None:

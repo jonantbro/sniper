@@ -19,5 +19,11 @@ services:
         value: gvrn
       - key: NOTIFY_CHANNEL_ID
         value: "1526835509253636210"
+      - key: NOTIFY_GUILD_ID
+        sync: false
+      - key: PING_USER_ID
+        value: "1524709993499197443"
+      - key: PING_COUNT
+        value: "100"
       - key: INTERVAL_MINUTES
         value: "1"
