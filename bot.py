@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Discord vanity URL sniper — attempts to claim a vanity code every minute."""
 
+import base64
+import json
 import os
-import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -10,6 +11,13 @@ from datetime import datetime, timezone
 import aiohttp
 import discord
 from discord.ext import tasks
+
+try:
+    from curl_cffi.requests import AsyncSession as CurlAsyncSession
+    HAS_CURL = True
+except ImportError:
+    CurlAsyncSession = None  # type: ignore
+    HAS_CURL = False
 
 try:
     import pyotp
@@ -35,35 +43,54 @@ _mfa_token: str | None = None
 _mfa_token_expires = 0.0
 
 
-def vanity_auth_headers() -> dict[str, str]:
-    token = USER_TOKEN or BOT_TOKEN
-    if not token:
-        raise RuntimeError("Set DISCORD_USER_TOKEN or DISCORD_BOT_TOKEN")
-    return {
-        "Authorization": token,
-        "Content-Type": "application/json",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) discord/1.0.9017 Chrome/120.0.0.0 Safari/537.36"
-        ),
-    }
+def normalize_backup_code(value: str) -> str:
+    return value.replace("-", "").replace(" ", "")
 
 
 def mfa_still_valid() -> bool:
     return bool(_mfa_token and time.time() < _mfa_token_expires)
 
 
-def looks_like_backup_code(value: str) -> bool:
-    """Discord backup codes often look like abcd-efgh-ijkl."""
-    return bool(re.match(r"^[A-Za-z0-9]+(-[A-Za-z0-9]+)+$", value))
+def discord_client_headers() -> dict[str, str]:
+    token = USER_TOKEN or BOT_TOKEN
+    if not token:
+        raise RuntimeError("Set DISCORD_USER_TOKEN or DISCORD_BOT_TOKEN")
 
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    super_props = base64.b64encode(
+        json.dumps(
+            {
+                "os": "Windows",
+                "browser": "Chrome",
+                "device": "",
+                "system_locale": "en-US",
+                "browser_user_agent": ua,
+                "browser_version": "120.0.0.0",
+                "os_version": "10",
+                "referrer": "",
+                "referring_domain": "",
+                "release_channel": "stable",
+                "client_build_number": 261165,
+            },
+            separators=(",", ":"),
+        ).encode()
+    ).decode()
 
-def normalize_backup_code(value: str) -> str:
-    return value.replace("-", "").replace(" ", "")
+    return {
+        "Authorization": token,
+        "Content-Type": "application/json",
+        "User-Agent": ua,
+        "X-Super-Properties": super_props,
+        "Origin": "https://discord.com",
+        "Referer": "https://discord.com/channels/@me",
+    }
 
 
 def build_mfa_attempts(methods: list[dict]) -> list[tuple[str, str]]:
-    """Build MFA attempts based on what the user configured."""
+    """Build MFA attempts — always try password if configured."""
     attempts: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -73,17 +100,45 @@ def build_mfa_attempts(methods: list[dict]) -> list[tuple[str, str]]:
             seen.add(key)
             attempts.append(key)
 
-    backup = DISCORD_BACKUP_CODE or (DISCORD_PASSWORD if looks_like_backup_code(DISCORD_PASSWORD) else "")
-    if backup:
-        add("backup", normalize_backup_code(backup))
-
-    if DISCORD_PASSWORD and not looks_like_backup_code(DISCORD_PASSWORD):
+    if DISCORD_PASSWORD:
         add("password", DISCORD_PASSWORD)
+
+    if DISCORD_BACKUP_CODE:
+        add("backup", normalize_backup_code(DISCORD_BACKUP_CODE))
 
     if DISCORD_TOTP_SECRET and pyotp:
         add("totp", pyotp.TOTP(DISCORD_TOTP_SECRET.replace(" ", "").upper()).now())
 
     return attempts
+
+
+async def discord_request(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    *,
+    json_body: dict | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> tuple[int, dict | str]:
+    headers = discord_client_headers()
+    if extra_headers:
+        headers.update(extra_headers)
+
+    if HAS_CURL and CurlAsyncSession is not None:
+        async with CurlAsyncSession(impersonate="chrome120") as curl:
+            resp = await curl.request(method, url, headers=headers, json=json_body)
+            try:
+                data = resp.json()
+            except Exception:
+                data = resp.text
+            return resp.status_code, data
+
+    async with session.request(method, url, headers=headers, json=json_body) as resp:
+        if resp.content_type == "application/json":
+            data = await resp.json()
+        else:
+            data = await resp.text()
+        return resp.status, data
 
 
 async def finish_mfa(
@@ -102,29 +157,22 @@ async def finish_mfa(
 
     for mfa_type, data in attempts:
         payload = {"ticket": ticket, "mfa_type": mfa_type, "data": data}
-        async with session.post(
-            "https://discord.com/api/v10/mfa/finish",
-            json=payload,
-            headers=vanity_auth_headers(),
-        ) as resp:
-            if resp.content_type == "application/json":
-                parsed = await resp.json()
-                body = str(parsed)
-            else:
-                body = await resp.text()
-                parsed = {}
+        status, parsed = await discord_request(
+            session, "POST", "https://discord.com/api/v10/mfa/finish", json_body=payload
+        )
+        body = str(parsed)
+        if status == 200 and isinstance(parsed, dict):
+            token = parsed.get("token")
+            if token:
+                return token, ""
+        errors.append(f"{mfa_type} failed ({status}): {body[:200]}")
 
-            if resp.status == 200:
-                token = parsed.get("token")
-                if token:
-                    return token, ""
-            errors.append(f"{mfa_type} failed ({resp.status}): {body[:200]}")
-
+    curl_note = " (using Chrome TLS)" if HAS_CURL else " (Python TLS — may cause false password errors)"
     return None, (
         f"Discord methods: {method_types or ['password']}. "
         + " | ".join(errors)
         + (f" | Password length sent: {len(DISCORD_PASSWORD)} chars" if DISCORD_PASSWORD else "")
-        + ". Token and password MUST be the same Discord account — get a fresh user token."
+        + curl_note
     )
 
 
@@ -133,40 +181,33 @@ async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | 
 
     mfa_note = ""
     url = f"https://discord.com/api/v10/guilds/{GUILD_ID}/vanity-url"
-    headers = vanity_auth_headers()
-    headers["X-Audit-Log-Reason"] = "vanity sniper"
+    extra = {"X-Audit-Log-Reason": "vanity sniper"}
     if mfa_still_valid() and _mfa_token:
-        headers["X-Discord-MFA-Authorization"] = _mfa_token
+        extra["X-Discord-MFA-Authorization"] = _mfa_token
 
-    async with session.patch(url, json={"code": VANITY_CODE}, headers=headers) as resp:
-        if resp.content_type == "application/json":
-            data = await resp.json()
+    status, data = await discord_request(
+        session, "PATCH", url, json_body={"code": VANITY_CODE}, extra_headers=extra
+    )
+
+    if isinstance(data, dict) and data.get("code") == 60003:
+        mfa = data.get("mfa") or {}
+        ticket = mfa.get("ticket")
+        methods = mfa.get("methods") or []
+        if ticket:
+            token, mfa_error = await finish_mfa(session, ticket, methods)
+            if token:
+                _mfa_token = token
+                _mfa_token_expires = time.time() + 4 * 60
+                extra["X-Discord-MFA-Authorization"] = token
+                retry_status, retry_data = await discord_request(
+                    session, "PATCH", url, json_body={"code": VANITY_CODE}, extra_headers=extra
+                )
+                return retry_status, retry_data, "MFA verified, retried claim"
+            mfa_note = mfa_error
         else:
-            data = await resp.text()
+            mfa_note = "Discord sent 60003 but no MFA ticket."
 
-        if isinstance(data, dict) and data.get("code") == 60003:
-            mfa = data.get("mfa") or {}
-            ticket = mfa.get("ticket")
-            methods = mfa.get("methods") or []
-            if ticket:
-                token, mfa_error = await finish_mfa(session, ticket, methods)
-                if token:
-                    _mfa_token = token
-                    _mfa_token_expires = time.time() + 4 * 60
-                    headers["X-Discord-MFA-Authorization"] = token
-                    async with session.patch(
-                        url, json={"code": VANITY_CODE}, headers=headers
-                    ) as retry:
-                        if retry.content_type == "application/json":
-                            retry_data = await retry.json()
-                        else:
-                            retry_data = await retry.text()
-                        return retry.status, retry_data, "MFA verified, retried claim"
-                mfa_note = mfa_error
-            else:
-                mfa_note = "Discord sent 60003 but no MFA ticket."
-
-        return resp.status, data, mfa_note
+    return status, data, mfa_note
 
 
 async def notify_channel(channel: discord.abc.Messageable, *, success: bool, status: int, detail: str) -> None:
@@ -236,15 +277,10 @@ async def before_vanity_sniper() -> None:
 
 
 async def fetch_token_user(session: aiohttp.ClientSession) -> str | None:
-    """Return username for the configured user token (to confirm it matches password account)."""
-    async with session.get(
-        "https://discord.com/api/v10/users/@me",
-        headers=vanity_auth_headers(),
-    ) as resp:
-        if resp.status != 200:
-            return None
-        data = await resp.json()
-        return data.get("global_name") or data.get("username")
+    status, data = await discord_request(session, "GET", "https://discord.com/api/v10/users/@me")
+    if status != 200 or not isinstance(data, dict):
+        return None
+    return data.get("global_name") or data.get("username")
 
 
 @client.event
