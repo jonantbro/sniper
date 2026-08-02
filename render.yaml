@@ -9,6 +9,10 @@ services:
         sync: false
       - key: DISCORD_USER_TOKEN
         sync: false
+      - key: DISCORD_PASSWORD
+        sync: false
+      - key: DISCORD_TOTP_SECRET
+        sync: false
       - key: GUILD_ID
         sync: false
       - key: VANITY_CODE
