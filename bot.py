@@ -17,7 +17,7 @@ except ImportError:
 
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 USER_TOKEN = os.getenv("DISCORD_USER_TOKEN", "").strip()
-DISCORD_PASSWORD = os.getenv("DISCORD_PASSWORD", "").strip()
+DISCORD_PASSWORD = os.getenv("DISCORD_PASSWORD", "").strip().strip('"').strip("'")
 DISCORD_TOTP_SECRET = os.getenv("DISCORD_TOTP_SECRET", "").strip()
 DISCORD_BACKUP_CODE = os.getenv("DISCORD_BACKUP_CODE", "").strip()
 GUILD_ID = os.getenv("GUILD_ID", "").strip()
@@ -110,7 +110,12 @@ async def finish_mfa(
                     return token, ""
             errors.append(f"{mfa_type} failed ({resp.status}): {body[:200]}")
 
-    return None, f"Discord methods: {method_types or ['password']}. " + " | ".join(errors)
+    return None, (
+        f"Discord methods: {method_types or ['password']}. "
+        + " | ".join(errors)
+        + (f" | Password length sent: {len(DISCORD_PASSWORD)} chars" if DISCORD_PASSWORD else "")
+        + ". Token and password MUST be the same Discord account — get a fresh user token."
+    )
 
 
 async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | str, str]:
@@ -215,6 +220,18 @@ async def before_vanity_sniper() -> None:
     await client.wait_until_ready()
 
 
+async def fetch_token_user(session: aiohttp.ClientSession) -> str | None:
+    """Return username for the configured user token (to confirm it matches password account)."""
+    async with session.get(
+        "https://discord.com/api/v10/users/@me",
+        headers=vanity_auth_headers(),
+    ) as resp:
+        if resp.status != 200:
+            return None
+        data = await resp.json()
+        return data.get("global_name") or data.get("username")
+
+
 @client.event
 async def on_ready() -> None:
     print(f"Logged in as {client.user} ({client.user.id})")
@@ -222,8 +239,16 @@ async def on_ready() -> None:
         channel = client.get_channel(NOTIFY_CHANNEL_ID)
         if channel is None:
             channel = await client.fetch_channel(NOTIFY_CHANNEL_ID)
+
+        token_account = "unknown (bad or expired token)"
+        async with aiohttp.ClientSession() as session:
+            user = await fetch_token_user(session)
+            if user:
+                token_account = user
+
         await channel.send(
-            f"Vanity sniper online — trying **`{VANITY_CODE}`** every **{INTERVAL_MINUTES}** minute(s)."
+            f"Vanity sniper online — trying **`{VANITY_CODE}`** every **{INTERVAL_MINUTES}** minute(s).\n"
+            f"User token account: **`{token_account}`** — password in Render must be for THIS account."
         )
         vanity_sniper.start()
 
