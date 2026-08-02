@@ -1,13 +1,10 @@
 services:
   - type: worker
     name: vanity-sniper
-    runtime: python
+    runtime: docker
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: chmod +x start.sh && ./start.sh
+    dockerfilePath: ./Dockerfile
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.12.8"
       - key: DISCORD_BOT_TOKEN
         sync: false
       - key: DISCORD_USER_TOKEN
