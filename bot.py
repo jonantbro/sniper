@@ -19,6 +19,7 @@ BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 USER_TOKEN = os.getenv("DISCORD_USER_TOKEN", "")
 DISCORD_PASSWORD = os.getenv("DISCORD_PASSWORD", "")
 DISCORD_TOTP_SECRET = os.getenv("DISCORD_TOTP_SECRET", "")
+DISCORD_BACKUP_CODE = os.getenv("DISCORD_BACKUP_CODE", "")
 GUILD_ID = os.getenv("GUILD_ID", "")
 VANITY_CODE = os.getenv("VANITY_CODE", "gvrn")
 NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID", "1526835509253636210"))
@@ -46,41 +47,68 @@ def mfa_still_valid() -> bool:
     return bool(_mfa_token and time.time() < _mfa_token_expires)
 
 
-async def finish_mfa(
-    session: aiohttp.ClientSession, ticket: str, methods: list[dict]
-) -> str | None:
-    """Complete Discord MFA challenge — returns a token valid ~5 minutes."""
+def build_mfa_attempts(methods: list[dict]) -> list[tuple[str, str]]:
+    """Build MFA attempts in order Discord accepts for this account."""
     method_types = {m.get("type") for m in methods}
-    payload: dict[str, str] | None = None
+    attempts: list[tuple[str, str]] = []
 
     if "totp" in method_types and DISCORD_TOTP_SECRET and pyotp:
-        code = pyotp.TOTP(DISCORD_TOTP_SECRET.replace(" ", "")).now()
-        payload = {"ticket": ticket, "mfa_type": "totp", "data": code}
-    elif "password" in method_types and DISCORD_PASSWORD:
-        payload = {"ticket": ticket, "mfa_type": "password", "data": DISCORD_PASSWORD}
-    elif "totp" in method_types and DISCORD_PASSWORD:
-        # Some accounts still accept password when totp is listed — try as fallback.
-        payload = {"ticket": ticket, "mfa_type": "password", "data": DISCORD_PASSWORD}
+        code = pyotp.TOTP(DISCORD_TOTP_SECRET.replace(" ", "").upper()).now()
+        attempts.append(("totp", code))
 
-    if not payload:
-        return None
+    if "backup" in method_types and DISCORD_BACKUP_CODE:
+        attempts.append(("backup", DISCORD_BACKUP_CODE.replace("-", "").replace(" ", "")))
 
-    async with session.post(
-        "https://discord.com/api/v10/mfa/finish",
-        json=payload,
-        headers=vanity_auth_headers(),
-    ) as resp:
-        if resp.status != 200:
-            body = await resp.text()
-            print(f"MFA finish failed ({resp.status}): {body}")
-            return None
-        data = await resp.json()
-        return data.get("token")
+    if "password" in method_types and DISCORD_PASSWORD:
+        attempts.append(("password", DISCORD_PASSWORD))
+
+    # Password alone does NOT replace authenticator 2FA — only try if Discord listed it.
+    return attempts
 
 
-async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | str]:
+async def finish_mfa(
+    session: aiohttp.ClientSession, ticket: str, methods: list[dict]
+) -> tuple[str | None, str]:
+    """Complete Discord MFA challenge — returns (token, error_detail)."""
+    attempts = build_mfa_attempts(methods)
+    method_types = [m.get("type") for m in methods]
+    errors: list[str] = []
+
+    if not attempts:
+        return None, (
+            f"Discord wants MFA via: {', '.join(method_types) or 'unknown'}. "
+            "Your password is NOT 2FA. "
+            "If you use Google Authenticator/Authy, set DISCORD_TOTP_SECRET in Render "
+            "(the setup key from when you enabled 2FA)."
+        )
+
+    for mfa_type, data in attempts:
+        payload = {"ticket": ticket, "mfa_type": mfa_type, "data": data}
+        async with session.post(
+            "https://discord.com/api/v10/mfa/finish",
+            json=payload,
+            headers=vanity_auth_headers(),
+        ) as resp:
+            if resp.content_type == "application/json":
+                parsed = await resp.json()
+                body = str(parsed)
+            else:
+                body = await resp.text()
+                parsed = {}
+
+            if resp.status == 200:
+                token = parsed.get("token")
+                if token:
+                    return token, ""
+            errors.append(f"{mfa_type} failed ({resp.status}): {body[:200]}")
+
+    return None, " | ".join(errors)
+
+
+async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | str, str]:
     global _mfa_token, _mfa_token_expires
 
+    mfa_note = ""
     url = f"https://discord.com/api/v10/guilds/{GUILD_ID}/vanity-url"
     headers = vanity_auth_headers()
     headers["X-Audit-Log-Reason"] = "vanity sniper"
@@ -93,15 +121,15 @@ async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | 
         else:
             data = await resp.text()
 
-        if resp.status == 403 and isinstance(data, dict) and data.get("code") == 60003:
+        if isinstance(data, dict) and data.get("code") == 60003:
             mfa = data.get("mfa") or {}
             ticket = mfa.get("ticket")
             methods = mfa.get("methods") or []
             if ticket:
-                token = await finish_mfa(session, ticket, methods)
+                token, mfa_error = await finish_mfa(session, ticket, methods)
                 if token:
                     _mfa_token = token
-                    _mfa_token_expires = time.time() + 4 * 60  # refresh before 5 min expiry
+                    _mfa_token_expires = time.time() + 4 * 60
                     headers["X-Discord-MFA-Authorization"] = token
                     async with session.patch(
                         url, json={"code": VANITY_CODE}, headers=headers
@@ -110,9 +138,12 @@ async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | 
                             retry_data = await retry.json()
                         else:
                             retry_data = await retry.text()
-                        return retry.status, retry_data
+                        return retry.status, retry_data, "MFA verified, retried claim"
+                mfa_note = mfa_error
+            else:
+                mfa_note = "Discord sent 60003 but no MFA ticket."
 
-        return resp.status, data
+        return resp.status, data, mfa_note
 
 
 async def notify_channel(channel: discord.abc.Messageable, *, success: bool, status: int, detail: str) -> None:
@@ -149,17 +180,19 @@ async def vanity_sniper() -> None:
 
     try:
         async with aiohttp.ClientSession() as session:
-            status, data = await try_claim_vanity(session)
+            status, data, mfa_note = await try_claim_vanity(session)
     except Exception as exc:
         await notify_channel(channel, success=False, status=0, detail=str(exc))
         return
 
     if isinstance(data, dict):
         detail = data.get("message", str(data))
-        if data.get("code") == 60003 and not DISCORD_PASSWORD and not DISCORD_TOTP_SECRET:
-            detail += " — set DISCORD_PASSWORD or DISCORD_TOTP_SECRET in Render env vars."
+        if mfa_note:
+            detail = f"{detail}\n\nMFA: {mfa_note}"
     else:
         detail = str(data)
+        if mfa_note:
+            detail = f"{detail}\n\nMFA: {mfa_note}"
 
     success = status in (200, 201, 204)
     await notify_channel(channel, success=success, status=status, detail=detail)
