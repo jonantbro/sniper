@@ -205,7 +205,7 @@ async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | 
                 retry_status, retry_data = await discord_request(
                     session, "PATCH", url, json_body={"code": VANITY_CODE}, extra_headers=extra
                 )
-                return retry_status, retry_data, "MFA verified, retried claim"
+                return retry_status, retry_data, "MFA verified ✓"
             mfa_note = mfa_error
         else:
             mfa_note = "Discord sent 60003 but no MFA ticket."
@@ -213,6 +213,29 @@ async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | 
         mfa_note = "DISCORD_MFA_TOKEN expired — run local_mfa.py on your Mac and update Render."
 
     return status, data, mfa_note
+
+
+def format_discord_error(data: dict, status: int) -> str:
+    code = data.get("code")
+    msg = data.get("message") or ""
+
+    hints = {
+        50020: f"`{VANITY_CODE}` is **taken** — not free yet. Bot is working; will keep trying every minute.",
+        20045: "Your server needs **Boost Level 3** to use vanity URLs.",
+        50013: "Account missing **Manage Server** permission on this guild.",
+        60003: "MFA expired — run `local_mfa.py` again or refresh DISCORD_MFA_TOKEN.",
+        50035: f"Invalid vanity code `{VANITY_CODE}` — check spelling/rules.",
+    }
+    if code in hints:
+        return hints[code]
+
+    if msg and msg != "Unknown Message":
+        return f"{msg} (code {code})" if code is not None else msg
+
+    if code is not None:
+        return f"Discord error code **{code}** (HTTP {status})"
+
+    return f"HTTP {status}: {json.dumps(data)[:200]}"
 
 
 async def notify_channel(channel: discord.abc.Messageable, *, success: bool, status: int, detail: str) -> None:
@@ -255,18 +278,13 @@ async def vanity_sniper() -> None:
         return
 
     if isinstance(data, dict):
-        detail = data.get("message", str(data))
-        code = data.get("code")
-        if code == 50020:
-            detail = f"`{VANITY_CODE}` is taken or invalid — vanity not available yet. Bot is working; will keep trying."
-        elif code == 20045:
-            detail = "Server does not meet vanity URL requirements (needs Boost Level 3)."
+        detail = format_discord_error(data, status)
         if mfa_note:
-            detail = f"{detail}\n\nMFA: {mfa_note}"
+            detail = f"{detail}\n\n{mfa_note}"
     else:
         detail = str(data)
         if mfa_note:
-            detail = f"{detail}\n\nMFA: {mfa_note}"
+            detail = f"{detail}\n\n{mfa_note}"
 
     success = status in (200, 201, 204)
     await notify_channel(channel, success=success, status=status, detail=detail)
