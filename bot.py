@@ -29,6 +29,7 @@ USER_TOKEN = os.getenv("DISCORD_USER_TOKEN", "").strip()
 DISCORD_PASSWORD = os.getenv("DISCORD_PASSWORD", "").strip().strip('"').strip("'")
 DISCORD_TOTP_SECRET = os.getenv("DISCORD_TOTP_SECRET", "").strip()
 DISCORD_BACKUP_CODE = os.getenv("DISCORD_BACKUP_CODE", "").strip()
+DISCORD_MFA_TOKEN = os.getenv("DISCORD_MFA_TOKEN", "").strip()
 GUILD_ID = os.getenv("GUILD_ID", "").strip()
 VANITY_CODE = os.getenv("VANITY_CODE", "gvrn")
 NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID", "1526835509253636210"))
@@ -182,14 +183,16 @@ async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | 
     mfa_note = ""
     url = f"https://discord.com/api/v10/guilds/{GUILD_ID}/vanity-url"
     extra = {"X-Audit-Log-Reason": "vanity sniper"}
-    if mfa_still_valid() and _mfa_token:
+    if DISCORD_MFA_TOKEN:
+        extra["X-Discord-MFA-Authorization"] = DISCORD_MFA_TOKEN
+    elif mfa_still_valid() and _mfa_token:
         extra["X-Discord-MFA-Authorization"] = _mfa_token
 
     status, data = await discord_request(
         session, "PATCH", url, json_body={"code": VANITY_CODE}, extra_headers=extra
     )
 
-    if isinstance(data, dict) and data.get("code") == 60003:
+    if isinstance(data, dict) and data.get("code") == 60003 and not DISCORD_MFA_TOKEN:
         mfa = data.get("mfa") or {}
         ticket = mfa.get("ticket")
         methods = mfa.get("methods") or []
@@ -206,6 +209,8 @@ async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | 
             mfa_note = mfa_error
         else:
             mfa_note = "Discord sent 60003 but no MFA ticket."
+    elif isinstance(data, dict) and data.get("code") == 60003 and DISCORD_MFA_TOKEN:
+        mfa_note = "DISCORD_MFA_TOKEN expired — run local_mfa.py on your Mac and update Render."
 
     return status, data, mfa_note
 
@@ -291,15 +296,29 @@ async def on_ready() -> None:
         if channel is None:
             channel = await client.fetch_channel(NOTIFY_CHANNEL_ID)
 
-        token_account = "unknown (bad or expired token)"
-        async with aiohttp.ClientSession() as session:
-            user = await fetch_token_user(session)
-            if user:
-                token_account = user
+        token_account = "MISSING — add DISCORD_USER_TOKEN in Render"
+        curl_status = "yes" if HAS_CURL else "no (install curl_cffi)"
+        if USER_TOKEN:
+            token_account = "invalid or expired token"
+            async with aiohttp.ClientSession() as session:
+                user = await fetch_token_user(session)
+                if user:
+                    token_account = user
+
+        mfa_hint = ""
+        if DISCORD_MFA_TOKEN:
+            mfa_hint = "\nUsing **DISCORD_MFA_TOKEN** from env (refresh every ~5 min with `local_mfa.py`)."
+        elif DISCORD_PASSWORD:
+            mfa_hint = (
+                "\nPassword MFA from Render often fails even when correct. "
+                "Run **`python3 local_mfa.py`** on your Mac → paste token as **DISCORD_MFA_TOKEN**."
+            )
 
         await channel.send(
             f"Vanity sniper online — trying **`{VANITY_CODE}`** every **{INTERVAL_MINUTES}** minute(s).\n"
-            f"User token account: **`{token_account}`** — password in Render must be for THIS account."
+            f"User token account: **`{token_account}`**\n"
+            f"Chrome TLS: **{curl_status}** | Password set: **{'yes' if DISCORD_PASSWORD else 'no'}**"
+            f"{mfa_hint}"
         )
         vanity_sniper.start()
 
