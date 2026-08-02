@@ -1,0 +1,20 @@
+services:
+  - type: worker
+    name: vanity-sniper
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 bot.py
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_USER_TOKEN
+        sync: false
+      - key: GUILD_ID
+        sync: false
+      - key: VANITY_CODE
+        value: gvrn
+      - key: NOTIFY_CHANNEL_ID
+        value: "1526835509253636210"
+      - key: INTERVAL_MINUTES
+        value: "1"
