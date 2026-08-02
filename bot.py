@@ -15,12 +15,12 @@ try:
 except ImportError:
     pyotp = None  # type: ignore
 
-BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
-USER_TOKEN = os.getenv("DISCORD_USER_TOKEN", "")
-DISCORD_PASSWORD = os.getenv("DISCORD_PASSWORD", "")
-DISCORD_TOTP_SECRET = os.getenv("DISCORD_TOTP_SECRET", "")
-DISCORD_BACKUP_CODE = os.getenv("DISCORD_BACKUP_CODE", "")
-GUILD_ID = os.getenv("GUILD_ID", "")
+BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+USER_TOKEN = os.getenv("DISCORD_USER_TOKEN", "").strip()
+DISCORD_PASSWORD = os.getenv("DISCORD_PASSWORD", "").strip()
+DISCORD_TOTP_SECRET = os.getenv("DISCORD_TOTP_SECRET", "").strip()
+DISCORD_BACKUP_CODE = os.getenv("DISCORD_BACKUP_CODE", "").strip()
+GUILD_ID = os.getenv("GUILD_ID", "").strip()
 VANITY_CODE = os.getenv("VANITY_CODE", "gvrn")
 NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID", "1526835509253636210"))
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "1"))
@@ -38,9 +38,14 @@ def vanity_auth_headers() -> dict[str, str]:
     token = USER_TOKEN or BOT_TOKEN
     if not token:
         raise RuntimeError("Set DISCORD_USER_TOKEN or DISCORD_BOT_TOKEN")
-    if token.startswith(("Bot ", "Bearer ")):
-        return {"Authorization": token, "Content-Type": "application/json"}
-    return {"Authorization": token, "Content-Type": "application/json"}
+    return {
+        "Authorization": token,
+        "Content-Type": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) discord/1.0.9017 Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
 
 
 def mfa_still_valid() -> bool:
@@ -48,21 +53,26 @@ def mfa_still_valid() -> bool:
 
 
 def build_mfa_attempts(methods: list[dict]) -> list[tuple[str, str]]:
-    """Build MFA attempts in order Discord accepts for this account."""
-    method_types = {m.get("type") for m in methods}
+    """Build MFA attempts — password first when no authenticator 2FA."""
     attempts: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
 
-    if "totp" in method_types and DISCORD_TOTP_SECRET and pyotp:
-        code = pyotp.TOTP(DISCORD_TOTP_SECRET.replace(" ", "").upper()).now()
-        attempts.append(("totp", code))
+    def add(mfa_type: str, data: str) -> None:
+        key = (mfa_type, data)
+        if key not in seen:
+            seen.add(key)
+            attempts.append(key)
 
-    if "backup" in method_types and DISCORD_BACKUP_CODE:
-        attempts.append(("backup", DISCORD_BACKUP_CODE.replace("-", "").replace(" ", "")))
+    # No authenticator 2FA → Discord asks for password to confirm. Always try it.
+    if DISCORD_PASSWORD:
+        add("password", DISCORD_PASSWORD)
 
-    if "password" in method_types and DISCORD_PASSWORD:
-        attempts.append(("password", DISCORD_PASSWORD))
+    if DISCORD_TOTP_SECRET and pyotp:
+        add("totp", pyotp.TOTP(DISCORD_TOTP_SECRET.replace(" ", "").upper()).now())
 
-    # Password alone does NOT replace authenticator 2FA — only try if Discord listed it.
+    if DISCORD_BACKUP_CODE:
+        add("backup", DISCORD_BACKUP_CODE.replace("-", "").replace(" ", ""))
+
     return attempts
 
 
@@ -76,10 +86,8 @@ async def finish_mfa(
 
     if not attempts:
         return None, (
-            f"Discord wants MFA via: {', '.join(method_types) or 'unknown'}. "
-            "Your password is NOT 2FA. "
-            "If you use Google Authenticator/Authy, set DISCORD_TOTP_SECRET in Render "
-            "(the setup key from when you enabled 2FA)."
+            "Discord asked to confirm your identity but DISCORD_PASSWORD is not set in Render. "
+            "Add your Discord login password as DISCORD_PASSWORD."
         )
 
     for mfa_type, data in attempts:
@@ -102,7 +110,7 @@ async def finish_mfa(
                     return token, ""
             errors.append(f"{mfa_type} failed ({resp.status}): {body[:200]}")
 
-    return None, " | ".join(errors)
+    return None, f"Discord methods: {method_types or ['password']}. " + " | ".join(errors)
 
 
 async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | str, str]:
