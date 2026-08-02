@@ -44,7 +44,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 claimed = False
 _attempt = 0
-_vanity_was_available = False
 _mfa_token: str | None = None
 _mfa_token_expires = 0.0
 
@@ -209,13 +208,6 @@ async def try_claim_vanity(session: aiohttp.ClientSession) -> tuple[int, dict | 
     return status, data, mfa_note
 
 
-async def check_vanity_available(session: aiohttp.ClientSession) -> bool:
-    status, _ = await discord_request(
-        session, "GET", f"https://discord.com/api/v10/invites/{VANITY_CODE}?with_counts=false"
-    )
-    return status == 404
-
-
 async def spam_ping(channel: discord.abc.Messageable) -> None:
     """Send PING_COUNT separate messages, each pinging the user."""
     mention = f"<@{PING_USER_ID}>"
@@ -236,6 +228,11 @@ def format_discord_error(data: dict, status: int) -> str:
     }
     if code in hints:
         return hints[code]
+
+    # Discord often returns 403 + "Unknown Message" when vanity is taken (after MFA passes).
+    if status == 403 and (not msg or msg == "Unknown Message"):
+        return f"`{VANITY_CODE}` is **taken** — not free yet. Bot is working; will keep trying."
+
     if msg and msg != "Unknown Message":
         return f"{msg} (code {code})" if code is not None else msg
     if code is not None:
@@ -266,7 +263,7 @@ async def notify_channel(channel: discord.abc.Messageable, *, success: bool, sta
 @bot.tree.command(name="set-claim", description="Set which vanity URL code to snipe")
 @app_commands.describe(vanity="Vanity code to claim (e.g. gvrn)")
 async def set_claim(interaction: discord.Interaction, vanity: str) -> None:
-    global VANITY_CODE, claimed, _vanity_was_available, _attempt
+    global VANITY_CODE, claimed, _attempt
 
     vanity = vanity.lower().strip()
     if not re.fullmatch(r"[a-z0-9-]{2,32}", vanity):
@@ -278,7 +275,6 @@ async def set_claim(interaction: discord.Interaction, vanity: str) -> None:
 
     VANITY_CODE = vanity
     claimed = False
-    _vanity_was_available = False
     _attempt = 0
 
     await interaction.response.send_message(
@@ -288,7 +284,7 @@ async def set_claim(interaction: discord.Interaction, vanity: str) -> None:
 
 @tasks.loop(minutes=INTERVAL_MINUTES)
 async def vanity_sniper() -> None:
-    global claimed, _attempt, _vanity_was_available
+    global claimed, _attempt
 
     if claimed:
         return
@@ -300,12 +296,6 @@ async def vanity_sniper() -> None:
 
     try:
         async with aiohttp.ClientSession() as session:
-            available = await check_vanity_available(session)
-            if available and not _vanity_was_available:
-                _vanity_was_available = True
-                await channel.send(f"**`discord.gg/{VANITY_CODE}` is AVAILABLE** — claiming now!")
-                await spam_ping(channel)
-
             status, data, mfa_note = await try_claim_vanity(session)
     except Exception as exc:
         await notify_channel(channel, success=False, status=0, detail=str(exc))
