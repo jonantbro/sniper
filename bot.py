@@ -2,6 +2,7 @@
 """Discord vanity URL sniper — attempts to claim a vanity code every minute."""
 
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -52,8 +53,17 @@ def mfa_still_valid() -> bool:
     return bool(_mfa_token and time.time() < _mfa_token_expires)
 
 
+def looks_like_backup_code(value: str) -> bool:
+    """Discord backup codes often look like abcd-efgh-ijkl."""
+    return bool(re.match(r"^[A-Za-z0-9]+(-[A-Za-z0-9]+)+$", value))
+
+
+def normalize_backup_code(value: str) -> str:
+    return value.replace("-", "").replace(" ", "")
+
+
 def build_mfa_attempts(methods: list[dict]) -> list[tuple[str, str]]:
-    """Build MFA attempts — password first when no authenticator 2FA."""
+    """Build MFA attempts based on what the user configured."""
     attempts: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -63,15 +73,15 @@ def build_mfa_attempts(methods: list[dict]) -> list[tuple[str, str]]:
             seen.add(key)
             attempts.append(key)
 
-    # No authenticator 2FA → Discord asks for password to confirm. Always try it.
-    if DISCORD_PASSWORD:
+    backup = DISCORD_BACKUP_CODE or (DISCORD_PASSWORD if looks_like_backup_code(DISCORD_PASSWORD) else "")
+    if backup:
+        add("backup", normalize_backup_code(backup))
+
+    if DISCORD_PASSWORD and not looks_like_backup_code(DISCORD_PASSWORD):
         add("password", DISCORD_PASSWORD)
 
     if DISCORD_TOTP_SECRET and pyotp:
         add("totp", pyotp.TOTP(DISCORD_TOTP_SECRET.replace(" ", "").upper()).now())
-
-    if DISCORD_BACKUP_CODE:
-        add("backup", DISCORD_BACKUP_CODE.replace("-", "").replace(" ", ""))
 
     return attempts
 
@@ -200,6 +210,11 @@ async def vanity_sniper() -> None:
 
     if isinstance(data, dict):
         detail = data.get("message", str(data))
+        code = data.get("code")
+        if code == 50020:
+            detail = f"`{VANITY_CODE}` is taken or invalid — vanity not available yet. Bot is working; will keep trying."
+        elif code == 20045:
+            detail = "Server does not meet vanity URL requirements (needs Boost Level 3)."
         if mfa_note:
             detail = f"{detail}\n\nMFA: {mfa_note}"
     else:
